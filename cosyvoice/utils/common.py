@@ -25,6 +25,30 @@ import torch
 
 IGNORE_ID = -1
 
+
+def get_device():
+    """Device selection: cuda > mps (Apple Silicon) > cpu. Override with COSYVOICE_DEVICE env."""
+    import os
+    override = os.environ.get("COSYVOICE_DEVICE", "").strip().lower()
+    if override in ("cpu", "cuda", "mps"):
+        return torch.device(override)
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
+def get_hift_device(main_device: torch.device) -> torch.device:
+    """HiFT vocoder device. When main is MPS and COSYVOICE_HIFT_DEVICE=cpu, use CPU for
+    vocoder to avoid MPS numerical differences that cause audio noise."""
+    import os
+    override = os.environ.get("COSYVOICE_HIFT_DEVICE", "").strip().lower()
+    if override == "cpu" and main_device.type == "mps":
+        return torch.device("cpu")
+    return main_device
+
+
 instruct_list = ["You are a helpful assistant. 请用广东话表达。<|endofprompt|>",
                  "You are a helpful assistant. 请用东北话表达。<|endofprompt|>",
                  "You are a helpful assistant. 请用甘肃话表达。<|endofprompt|>",

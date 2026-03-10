@@ -712,9 +712,17 @@ class CausalHiFTGenerator(HiFTGenerator):
 
     @torch.inference_mode()
     def inference(self, speech_feat: torch.Tensor, finalize: bool = True) -> torch.Tensor:
-        # mel->f0 NOTE f0_predictor precision is crucial for causal inference, move self.f0_predictor to cpu if necessary
-        self.f0_predictor.to(torch.float64)
-        f0 = self.f0_predictor(speech_feat.to(torch.float64), finalize=finalize).to(speech_feat)
+        # mel->f0 NOTE f0_predictor precision is crucial for causal inference.
+        # MPS does not support float64; run f0_predictor on CPU when on MPS.
+        device = speech_feat.device
+        if device.type == 'mps':
+            self.f0_predictor = self.f0_predictor.cpu().to(torch.float64)
+            f0 = self.f0_predictor(speech_feat.cpu().to(torch.float64), finalize=finalize)
+            f0 = f0.to(device, dtype=speech_feat.dtype)
+            self.f0_predictor = self.f0_predictor.float().to(device)
+        else:
+            self.f0_predictor.to(torch.float64)
+            f0 = self.f0_predictor(speech_feat.to(torch.float64), finalize=finalize).to(speech_feat)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
         s, _, _ = self.m_source(s)
