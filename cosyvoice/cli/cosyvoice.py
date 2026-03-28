@@ -37,12 +37,17 @@ class CosyVoice:
         with open(hyper_yaml_path, 'r') as f:
             configs = load_hyperpyyaml(f)
         assert get_model_type(configs) == CosyVoiceModel, 'do not use {} for CosyVoice initialization!'.format(model_dir)
-        self.frontend = CosyVoiceFrontEnd(configs['get_tokenizer'],
-                                          configs['feat_extractor'],
-                                          '{}/campplus.onnx'.format(model_dir),
-                                          '{}/speech_tokenizer_v1.onnx'.format(model_dir),
-                                          '{}/spk2info.pt'.format(model_dir),
-                                          configs['allowed_special'])
+        # frontend 负责将原始输入转换为适合声学模型的特征和结构化信息。在此，CosyVoiceFrontEnd 用于文本归一化、提取特征、将文本/说话人/wav等输入转为模型可识别的数据，并管理说话人信息（如 spk2info）。所有零样本和微调模式中的数据准备，都通过 frontend 统一完成。
+        self.frontend = CosyVoiceFrontEnd(
+            # 这些都是 config 配置项，对应 cosyvoice.yaml 文件里定义的 key，用于初始化 CosyVoiceFrontEnd。
+            # 通过 load_hyperpyyaml(f) 读取 config，实例化 CosyVoice 时就会调用这些参数。
+            configs['get_tokenizer'],             # 分词器函数，解析文本
+            configs['feat_extractor'],           # 特征提取器，提取音频特征
+            '{}/campplus.onnx'.format(model_dir),            # 声学模型前端 ONNX
+            '{}/speech_tokenizer_v1.onnx'.format(model_dir), # 语音 tokenizer 模型
+            '{}/spk2info.pt'.format(model_dir),              # 说话人信息
+            configs['allowed_special']            # 特殊 token 定义集合
+        )
         self.sample_rate = configs['sample_rate']
         if torch.cuda.is_available() is False and (load_jit is True or load_trt is True or fp16 is True):
             load_jit, load_trt, fp16 = False, False, False
@@ -78,6 +83,7 @@ class CosyVoice:
         torch.save(self.frontend.spk2info, '{}/spk2info.pt'.format(self.model_dir))
 
     def inference_sft(self, tts_text, spk_id, stream=False, speed=1.0, text_frontend=True):
+        # 意思是：对tts_text做归一化处理（比如清洗文本、标准化、分句等），且如果split=True，则进行分句/分段，然后对每个归一化后的片段i进行遍历。tqdm用于显示进度条。
         for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
             model_input = self.frontend.frontend_sft(i, spk_id)
             start_time = time.time()
@@ -114,7 +120,7 @@ class CosyVoice:
                 start_time = time.time()
 
     def inference_instruct(self, tts_text, spk_id, instruct_text, stream=False, speed=1.0, text_frontend=True):
-        assert self.__class__.__name__ == 'CosyVoice', 'inference_instruct is only implemented for CosyVoice!'
+        assert self.__class__.__name__ in ('CosyVoice', 'CosyVoice3'), 'inference_instruct is only implemented for CosyVoice/CosyVoice3!'
         instruct_text = self.frontend.text_normalize(instruct_text, split=False, text_frontend=text_frontend)
         for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
             model_input = self.frontend.frontend_instruct(i, spk_id, instruct_text)
@@ -223,6 +229,36 @@ class CosyVoice3(CosyVoice2):
                                 trt_concurrent,
                                 self.fp16)
         del configs
+
+    @staticmethod
+    def _ensure_cosyvoice3_endofprompt(text: str) -> str:
+        """CosyVoice3LM requires token <|endofprompt|> (id 151646) in the LLM text stream; see cosyvoice/llm/llm.py."""
+        if text is None or text == '' or '<|endofprompt|>' in text:
+            return text
+        return 'You are a helpful assistant.<|endofprompt|>' + text
+
+    def inference_sft(self, tts_text, spk_id, stream=False, speed=1.0, text_frontend=True):
+        tts_text = self._ensure_cosyvoice3_endofprompt(tts_text)
+        return super().inference_sft(tts_text, spk_id, stream=stream, speed=speed, text_frontend=text_frontend)
+
+    def inference_zero_shot(self, tts_text, prompt_text, prompt_wav, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
+        prompt_text = self._ensure_cosyvoice3_endofprompt(prompt_text)
+        return super().inference_zero_shot(tts_text, prompt_text, prompt_wav, zero_shot_spk_id=zero_shot_spk_id,
+                                           stream=stream, speed=speed, text_frontend=text_frontend)
+
+    def inference_cross_lingual(self, tts_text, prompt_wav, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
+        tts_text = self._ensure_cosyvoice3_endofprompt(tts_text)
+        return super().inference_cross_lingual(tts_text, prompt_wav, zero_shot_spk_id=zero_shot_spk_id,
+                                               stream=stream, speed=speed, text_frontend=text_frontend)
+
+    def inference_instruct(self, tts_text, spk_id, instruct_text, stream=False, speed=1.0, text_frontend=True):
+        instruct_text = self._ensure_cosyvoice3_endofprompt(instruct_text)
+        return super().inference_instruct(tts_text, spk_id, instruct_text, stream=stream, speed=speed, text_frontend=text_frontend)
+
+    def inference_instruct2(self, tts_text, instruct_text, prompt_wav, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
+        instruct_text = self._ensure_cosyvoice3_endofprompt(instruct_text)
+        return super().inference_instruct2(tts_text, instruct_text, prompt_wav, zero_shot_spk_id=zero_shot_spk_id,
+                                           stream=stream, speed=speed, text_frontend=text_frontend)
 
 
 def AutoModel(**kwargs):

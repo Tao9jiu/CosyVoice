@@ -13,6 +13,8 @@
 # limitations under the License.
 import os
 import sys
+
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 import argparse
 import gradio as gr
 import numpy as np
@@ -33,6 +35,22 @@ instruct_dict = {'预训练音色': '1. 选择预训练音色\n2. 点击生成�
                  '自然语言控制': '1. 选择预训练音色\n2. 输入instruct文本\n3. 点击生成音频按钮'}
 stream_mode_list = [('否', False), ('是', True)]
 max_val = 0.8
+
+
+def _iter_tts_to_numpy_audio(cosyvoice, inference_generator):
+    """Merge all chunks from CosyVoice inference into one float32 waveform for Gradio (avoids empty/broken files when gr.Audio used with streaming)."""
+    chunks = []
+    sr = cosyvoice.sample_rate
+    for item in inference_generator:
+        x = item['tts_speech']
+        if x is None or x.numel() == 0:
+            continue
+        chunks.append(x.detach().cpu().numpy().flatten().astype(np.float32))
+    if not chunks:
+        return sr, np.zeros(sr, dtype=np.float32)
+    audio = np.concatenate(chunks)
+    np.clip(audio, -1.0, 1.0, out=audio)
+    return sr, audio
 
 
 def generate_seed():
@@ -60,6 +78,11 @@ def generate_audio(tts_text, mode_checkbox_group, sft_dropdown, prompt_text, pro
         if instruct_text == '':
             gr.Warning('您正在使用自然语言控制模式, 请输入instruct文本')
             yield (cosyvoice.sample_rate, default_data)
+            return
+        if sft_dropdown == '':
+            gr.Warning('没有可用的预训练音色或尚未选择音色！')
+            yield (cosyvoice.sample_rate, default_data)
+            return
         if prompt_wav is not None or prompt_text != '':
             gr.Info('您正在使用自然语言控制模式, prompt音频/prompt文本会被忽略')
     # if cross_lingual mode, please make sure that model is iic/CosyVoice-300M and tts_text prompt_text are different language
@@ -69,15 +92,18 @@ def generate_audio(tts_text, mode_checkbox_group, sft_dropdown, prompt_text, pro
         if prompt_wav is None:
             gr.Warning('您正在使用跨语种复刻模式, 请提供prompt音频')
             yield (cosyvoice.sample_rate, default_data)
+            return
         gr.Info('您正在使用跨语种复刻模式, 请确保合成文本和prompt文本为不同语言')
     # if in zero_shot cross_lingual, please make sure that prompt_text and prompt_wav meets requirements
     if mode_checkbox_group in ['3s极速复刻', '跨语种复刻']:
         if prompt_wav is None:
             gr.Warning('prompt音频为空，您是否忘记输入prompt音频？')
             yield (cosyvoice.sample_rate, default_data)
+            return
         if torchaudio.info(prompt_wav).sample_rate < prompt_sr:
             gr.Warning('prompt音频采样率{}低于{}'.format(torchaudio.info(prompt_wav).sample_rate, prompt_sr))
             yield (cosyvoice.sample_rate, default_data)
+            return
     # sft mode only use sft_dropdown
     if mode_checkbox_group in ['预训练音色']:
         if instruct_text != '' or prompt_wav is not None or prompt_text != '':
@@ -85,34 +111,36 @@ def generate_audio(tts_text, mode_checkbox_group, sft_dropdown, prompt_text, pro
         if sft_dropdown == '':
             gr.Warning('没有可用的预训练音色！')
             yield (cosyvoice.sample_rate, default_data)
+            return
     # zero_shot mode only use prompt_wav prompt text
     if mode_checkbox_group in ['3s极速复刻']:
         if prompt_text == '':
             gr.Warning('prompt文本为空，您是否忘记输入prompt文本？')
             yield (cosyvoice.sample_rate, default_data)
+            return
         if instruct_text != '':
             gr.Info('您正在使用3s极速复刻模式，预训练音色/instruct文本会被忽略！')
 
     if mode_checkbox_group == '预训练音色':
         logging.info('get sft inference request')
         set_all_random_seed(seed)
-        for i in cosyvoice.inference_sft(tts_text, sft_dropdown, stream=stream, speed=speed):
-            yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
+        sr, audio = _iter_tts_to_numpy_audio(cosyvoice, cosyvoice.inference_sft(tts_text, sft_dropdown, stream=stream, speed=speed))
+        yield (sr, audio)
     elif mode_checkbox_group == '3s极速复刻':
         logging.info('get zero_shot inference request')
         set_all_random_seed(seed)
-        for i in cosyvoice.inference_zero_shot(tts_text, prompt_text, prompt_wav, stream=stream, speed=speed):
-            yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
+        sr, audio = _iter_tts_to_numpy_audio(cosyvoice, cosyvoice.inference_zero_shot(tts_text, prompt_text, prompt_wav, stream=stream, speed=speed))
+        yield (sr, audio)
     elif mode_checkbox_group == '跨语种复刻':
         logging.info('get cross_lingual inference request')
         set_all_random_seed(seed)
-        for i in cosyvoice.inference_cross_lingual(tts_text, prompt_wav, stream=stream, speed=speed):
-            yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
+        sr, audio = _iter_tts_to_numpy_audio(cosyvoice, cosyvoice.inference_cross_lingual(tts_text, prompt_wav, stream=stream, speed=speed))
+        yield (sr, audio)
     else:
         logging.info('get instruct inference request')
         set_all_random_seed(seed)
-        for i in cosyvoice.inference_instruct(tts_text, sft_dropdown, instruct_text, stream=stream, speed=speed):
-            yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
+        sr, audio = _iter_tts_to_numpy_audio(cosyvoice, cosyvoice.inference_instruct(tts_text, sft_dropdown, instruct_text, stream=stream, speed=speed))
+        yield (sr, audio)
 
 
 def main():
@@ -142,7 +170,7 @@ def main():
 
         generate_button = gr.Button("生成音频")
 
-        audio_output = gr.Audio(label="合成音频", autoplay=True, streaming=True)
+        audio_output = gr.Audio(label="合成音频", autoplay=True, streaming=False)
 
         seed_button.click(generate_seed, inputs=[], outputs=seed)
         generate_button.click(generate_audio,
